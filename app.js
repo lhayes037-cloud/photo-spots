@@ -214,12 +214,137 @@ function filterSpots(spots, cat, shoot) {
   });
 }
 
+/* ---------- Best right now ---------- */
+/* Which kind of light each place type shines in. Open spots (water, views) love golden hour.
+   Shady or colorful spots (parks, gardens, murals) also work well under soft cloud cover.
+   Nature spots are best early in the morning. */
+var CAT_LIGHT = {
+  beach: 'edge', pier: 'edge', viewpoint: 'edge', lighthouse: 'edge', bridge: 'edge',
+  nature: 'morning',
+  art: 'soft', garden: 'soft', park: 'soft', historic: 'soft',
+  other: 'any'
+};
+
+function fmtMins(m) {
+  m = Math.max(1, Math.round(m));
+  if (m < 60) return m + ' min';
+  var h = Math.floor(m / 60), r = m % 60;
+  return h + ' hr' + (r ? ' ' + r + ' min' : '');
+}
+
+/* Tells us if we are inside golden or blue hour right now, or how long until the next one. */
+function lightWindow(now, evToday, evTomorrow) {
+  var t = now.getTime();
+  function ms(d) { return d && !isNaN(d.getTime()) ? d.getTime() : null; }
+  var dark = false;
+  if (ms(evToday.dawn) != null && ms(evToday.dusk) != null) dark = t < ms(evToday.dawn) || t >= ms(evToday.dusk);
+  var wins = [
+    { start: ms(evToday.dawn), end: ms(evToday.sunrise), kind: 'blue', side: 'morning' },
+    { start: ms(evToday.sunrise), end: ms(evToday.goldenMorningEnd), kind: 'golden', side: 'morning' },
+    { start: ms(evToday.goldenEveningStart), end: ms(evToday.sunset), kind: 'golden', side: 'evening' },
+    { start: ms(evToday.sunset), end: ms(evToday.dusk), kind: 'blue', side: 'evening' }
+  ];
+  if (evTomorrow) {
+    wins.push({ start: ms(evTomorrow.dawn), end: ms(evTomorrow.sunrise), kind: 'blue', side: 'morning' });
+    wins.push({ start: ms(evTomorrow.sunrise), end: ms(evTomorrow.goldenMorningEnd), kind: 'golden', side: 'morning' });
+  }
+  var i, w, next = null;
+  for (i = 0; i < wins.length; i++) {
+    w = wins[i];
+    if (w.start == null || w.end == null) continue;
+    if (t >= w.start && t < w.end) {
+      return { phase: 'now', kind: w.kind, side: w.side, minutes: 0, endsIn: (w.end - t) / 60000, dark: dark };
+    }
+    if (w.start > t && (!next || w.start < next.start)) next = w;
+  }
+  if (next) return { phase: 'soon', kind: next.kind, side: next.side, minutes: (next.start - t) / 60000, dark: dark };
+  return { phase: 'none', dark: dark };
+}
+
+/* Gives a spot a score for right now, plus a short reason in plain words.
+   ctx = { light, clouds, rain, ratings, catAvg, saved, flickrOf } */
+function scoreSpot(s, ctx) {
+  var score = 0, reasons = [];
+  function add(pts, text) {
+    score += pts;
+    if (text && pts > 0) reasons.push({ pts: pts, text: text });
+  }
+  var lw = ctx.light || { phase: 'none' };
+  var fit = CAT_LIGHT[s.cat] || 'any';
+
+  function mult(side) {
+    if (fit === 'morning') return side === 'morning' ? 1 : 0.5;
+    if (fit === 'soft') return 0.7;
+    if (fit === 'any') return 0.8;
+    return 1;
+  }
+
+  if (lw.phase === 'now') {
+    add((lw.kind === 'golden' ? 30 : 18) * mult(lw.side),
+      (lw.kind === 'golden' ? 'Golden hour right now' : 'Blue hour right now') + ' (ends in ' + fmtMins(lw.endsIn) + ')');
+  } else if (lw.phase === 'soon') {
+    var limit = lw.kind === 'golden' ? 120 : 90;
+    if (lw.minutes <= limit) {
+      add((lw.kind === 'golden' ? 26 : 14) * mult(lw.side) * (1 - lw.minutes / limit),
+        (lw.kind === 'golden' ? 'Golden hour starts in ' : 'Blue hour starts in ') + fmtMins(lw.minutes));
+    }
+  }
+
+  if (fit === 'soft' && lw.phase !== 'now' && !lw.dark && ctx.clouds != null &&
+      ctx.clouds >= 40 && ctx.clouds <= 90 && (ctx.rain == null || ctx.rain < 30)) {
+    add(14, 'Soft cloud cover right now, easy light for portraits');
+  }
+
+  var r = ctx.ratings && ctx.ratings[s.id];
+  if (r) {
+    add((r.n - 3) * 8, r.n >= 4 ? 'You rated this ' + r.n + ' stars' : '');
+  } else if (ctx.catAvg && ctx.catAvg[s.cat] != null) {
+    add((ctx.catAvg[s.cat] - 3) * 4, ctx.catAvg[s.cat] >= 4 ? 'You like places like this' : '');
+  }
+
+  var n = ctx.flickrOf ? ctx.flickrOf(s.id) : null;
+  if (n != null) {
+    if (n >= 300) add(12, 'Very popular with photographers');
+    else if (n >= 60) add(8, 'Popular with photographers');
+    else if (n >= 10) add(3, '');
+  }
+  if (ctx.saved && ctx.saved[s.id]) add(5, 'You saved this');
+
+  score -= 1.5 * Math.min(s.dist || 0, 20);
+
+  var why = '';
+  reasons.forEach(function (x) { if (!why || x.pts > why.pts) why = x; });
+  why = why ? why.text : '';
+  if (!why) {
+    var shoots = (CAT_SHOOTS[s.cat] || []).slice(0, 2).map(function (k) { return SHOOTS[k].toLowerCase(); });
+    if (shoots.length && s.cat !== 'other') why = 'Good for ' + shoots.join(' and ');
+  }
+  return { score: score, why: why };
+}
+
+/* What other photographers shoot here, from the tags on their Flickr photos. */
+var TAG_WORDS = ['sunset', 'sunrise', 'portrait', 'wedding', 'engagement', 'couple', 'family', 'bird', 'wildlife',
+  'mural', 'streetphotography', 'seascape', 'landscape', 'skyline', 'fishing', 'surf', 'beach'];
+
+function topTags(photos, n) {
+  var counts = {};
+  (photos || []).forEach(function (p) {
+    var seen = {};
+    String(p.tags || '').toLowerCase().split(/\s+/).forEach(function (t) {
+      if (TAG_WORDS.indexOf(t) !== -1 && !seen[t]) { seen[t] = 1; counts[t] = (counts[t] || 0) + 1; }
+    });
+  });
+  return Object.keys(counts).filter(function (k) { return counts[k] >= 3; })
+    .sort(function (a, b) { return counts[b] - counts[a]; }).slice(0, n || 3);
+}
+
 if (typeof module !== 'undefined') {
   module.exports = {
     CATS: CATS, CAT_ORDER: CAT_ORDER, SHOOTS: SHOOTS, SHOOT_ORDER: SHOOT_ORDER, CAT_SHOOTS: CAT_SHOOTS,
     categorize: categorize, milesBetween: milesBetween, buildQuery: buildQuery, parseElements: parseElements,
     sunEvents: sunEvents, fmtTime: fmtTime, weatherVerdict: weatherVerdict, pickHour: pickHour,
-    flickrTier: flickrTier, filterSpots: filterSpots
+    flickrTier: flickrTier, filterSpots: filterSpots,
+    CAT_LIGHT: CAT_LIGHT, fmtMins: fmtMins, lightWindow: lightWindow, scoreSpot: scoreSpot, topTags: topTags
   };
 }
 
@@ -235,9 +360,10 @@ if (typeof document !== 'undefined') {
 
   var $ = function (id) { return document.getElementById(id); };
   var state = {
-    pos: null, miles: 10, osm: [], filter: 'all', shoot: 'all', sort: 'near', selected: null,
+    pos: null, miles: 10, osm: [], filter: 'all', shoot: 'all', sort: 'best', selected: null,
     saved: {}, mine: {}, notes: {}, map: null, markers: {}, meMarker: null, view: 'list',
-    day: 0, weather: null, flickrKey: '', flickr: {}, picking: false, draft: null
+    day: 0, weather: null, flickrKey: '', flickr: {}, picking: false, draft: null,
+    ratings: {}, flPhotos: {}, flLoading: {}
   };
 
   function lsGet(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
@@ -246,6 +372,7 @@ if (typeof document !== 'undefined') {
   state.saved = lsGet('ps:saved') || {};
   state.mine = lsGet('ps:mine') || {};
   state.notes = lsGet('ps:notes') || {};
+  state.ratings = lsGet('ps:rate') || {};
   state.flickr = lsGet('ps:fl') || {};
   state.flickrKey = lsGet('ps:flkey') || '';
   var savedMiles = lsGet('ps:miles');
@@ -291,13 +418,40 @@ if (typeof document !== 'undefined') {
     return arr;
   }
 
+  /* Average star rating you gave each kind of place, so the app learns what you like. */
+  function catAverages() {
+    var sum = {}, cnt = {}, out = {};
+    Object.keys(state.ratings).forEach(function (id) {
+      var r = state.ratings[id];
+      sum[r.cat] = (sum[r.cat] || 0) + r.n;
+      cnt[r.cat] = (cnt[r.cat] || 0) + 1;
+    });
+    Object.keys(sum).forEach(function (c) { out[c] = sum[c] / cnt[c]; });
+    return out;
+  }
+
+  function bestCtx() {
+    var light = { phase: 'none' }, w = null;
+    if (state.pos) {
+      var now = new Date();
+      light = lightWindow(now, sunEvents(dayDate(0), state.pos.lat, state.pos.lon), sunEvents(dayDate(1), state.pos.lat, state.pos.lon));
+      w = weatherAt(now);
+    }
+    return { light: light, clouds: w ? w.clouds : null, rain: w ? w.rain : null,
+      ratings: state.ratings, catAvg: catAverages(), saved: state.saved, flickrOf: flickrCount };
+  }
+
   function visibleSpots() {
     var base;
     if (state.filter === 'saved') base = savedList();
     else if (state.filter === 'mine') base = mineList().sort(function (a, b) { return a.dist - b.dist; });
     else base = filterSpots(allSpots(), state.filter, null);
     base = filterSpots(base, null, state.shoot);
-    if (state.sort === 'popular') {
+    var ctx = bestCtx();
+    base.forEach(function (s) { var r = scoreSpot(s, ctx); s.score = r.score; s.why = r.why; });
+    if (state.sort === 'best') {
+      base = base.slice().sort(function (a, b) { return b.score - a.score || a.dist - b.dist; });
+    } else if (state.sort === 'popular') {
       base = base.slice().sort(function (a, b) {
         var fa = flickrCount(a.id), fb = flickrCount(b.id);
         if (fa == null && fb == null) return a.dist - b.dist;
@@ -453,6 +607,27 @@ if (typeof document !== 'undefined') {
     next();
   }
 
+  /* Photos other people took near a spot, most interesting first. Loads only when you ask. */
+  function loadPhotos(s) {
+    if (!state.flickrKey || state.flLoading[s.id]) return;
+    state.flLoading[s.id] = true;
+    safeRender();
+    var url = 'https://api.flickr.com/services/rest/?method=flickr.photos.search&api_key=' + encodeURIComponent(state.flickrKey) +
+      '&lat=' + s.lat + '&lon=' + s.lon + '&radius=0.3&radius_units=km&has_geo=1&sort=interestingness-desc' +
+      '&per_page=60&extras=url_q,tags&format=json&nojsoncallback=1';
+    fetch(url).then(function (r) { return r.json(); }).then(function (j) {
+      if (j.stat !== 'ok') throw new Error('flickr');
+      state.flPhotos[s.id] = (j.photos.photo || []).map(function (p) {
+        return { id: p.id, owner: p.owner, tags: p.tags || '', url: p.url_q || '', title: p.title || '' };
+      });
+    }).catch(function () {
+      setStatus('Flickr didn\'t answer. Check your key in Settings.');
+    }).then(function () {
+      state.flLoading[s.id] = false;
+      safeRender();
+    });
+  }
+
   /* ---------- UI helpers ---------- */
   function setStatus(t) { $('status').textContent = t; }
   function showMessage(t, retry) {
@@ -507,7 +682,15 @@ if (typeof document !== 'undefined') {
       list.innerHTML = '<p class="empty">' + msg + '</p>';
       return;
     }
-    spots.forEach(function (s) {
+    var grouped = state.sort === 'best' && spots.length > 3;
+    spots.forEach(function (s, idx) {
+      if (grouped && (idx === 0 || idx === 3)) {
+        var lb = document.createElement('div');
+        lb.className = 'lbl';
+        if (idx === 0) lb.style.marginTop = '0';
+        lb.textContent = idx === 0 ? 'Top picks' : 'More spots';
+        list.appendChild(lb);
+      }
       var card = document.createElement('div');
       card.className = 'card' + (state.selected === s.id ? ' open' : '');
       card.id = 'card-' + s.id.replace('/', '-');
@@ -520,8 +703,11 @@ if (typeof document !== 'undefined') {
         (s.mine ? '<span class="tag p-mine">Mine</span>' : '') +
         (tier ? '<span class="tag p-pop">' + esc(tier) + '</span>' : '') +
         '<span class="dist">' + fmtDist(s.dist) + '</span>' +
+        (state.ratings[s.id] ? '<span class="dist">&#9733;' + state.ratings[s.id].n + '</span>' : '') +
         (state.notes[s.id] ? '<span class="dist" title="Has notes">&#9998;</span>' : '') +
-        '</span></span>' +
+        '</span>' +
+        (s.why ? '<span class="why">' + esc(s.why) + '</span>' : '') +
+        '</span>' +
         (state.saved[s.id] ? '<span class="star on" aria-label="Saved">&#9733;</span>' : '');
       head.onclick = function () { select(state.selected === s.id ? null : s.id, true); };
       card.appendChild(head);
@@ -559,10 +745,41 @@ if (typeof document !== 'undefined') {
     d.className = 'detail';
     var shoots = (CAT_SHOOTS[s.cat] || []).map(function (k) { return '<span class="tag p-all">' + esc(SHOOTS[k]) + '</span>'; }).join(' ');
     var html = '<div class="lbl">Good for</div><p>' + esc(CATS[s.cat].tip) + '</p><div class="tags">' + shoots + '</div>';
+    var rn = state.ratings[s.id] ? state.ratings[s.id].n : 0;
+    html += '<div class="lbl">Your rating</div><div class="rate">';
+    for (var k = 1; k <= 5; k++) {
+      html += '<button data-n="' + k + '" class="' + (k <= rn ? 'on' : '') + '" aria-label="' + k + (k === 1 ? ' star' : ' stars') + '">&#9733;</button>';
+    }
+    html += '</div><p class="hint">Rate it after you shoot here. The app uses your ratings to rank spots for you.</p>';
+
     html += lightBlock(s);
 
     var cnt = flickrCount(s.id);
-    if (cnt != null) html += '<div class="lbl">Popularity</div><p>About ' + cnt + ' public Flickr photos were taken within 200 meters of here.</p>';
+    var photos = state.flPhotos[s.id];
+    html += '<div class="lbl">Other photographers</div>';
+    if (cnt != null) html += '<p>About ' + cnt + ' public Flickr photos were taken within 200 meters of here.</p>';
+    if (photos) {
+      var tg = topTags(photos, 3);
+      if (tg.length) html += '<p>Often shot for: ' + esc(tg.join(', ')) + '.</p>';
+      var shown = photos.filter(function (p) { return /^https:\/\//.test(p.url); }).slice(0, 6);
+      if (shown.length) {
+        html += '<div class="thumbs">';
+        shown.forEach(function (p) {
+          html += '<a target="_blank" rel="noopener" href="https://www.flickr.com/photos/' + esc(p.owner) + '/' + esc(p.id) + '">' +
+            '<img src="' + esc(p.url) + '" alt="' + esc(p.title) + '" loading="lazy"></a>';
+        });
+        html += '</div><p class="hint">These photos belong to the people who took them. Tap one to open it on Flickr.</p>';
+      } else {
+        html += '<p>No public photos found right here.</p>';
+      }
+    } else if (state.flickrKey) {
+      html += state.flLoading[s.id]
+        ? '<p class="hint">Loading photos...</p>'
+        : '<div class="actions" style="margin-top:8px"><button class="btn" id="photoBtn">See photos from here</button></div>';
+    } else {
+      html += '<p class="hint">Add a free Flickr key to see photos other people took here.</p>' +
+        '<div class="actions" style="margin-top:8px"><button class="btn" id="keyBtn">Add Flickr key</button></div>';
+    }
 
     var i = s.info || {};
     var rows = [];
@@ -599,6 +816,22 @@ if (typeof document !== 'undefined') {
     d.querySelectorAll('.seg button').forEach(function (b) {
       b.onclick = function (e) { e.stopPropagation(); state.day = parseInt(b.getAttribute('data-day'), 10); render(); };
     });
+    d.querySelectorAll('.rate button').forEach(function (b) {
+      b.onclick = function (e) {
+        e.stopPropagation();
+        var n = parseInt(b.getAttribute('data-n'), 10);
+        if (state.ratings[s.id] && state.ratings[s.id].n === n) delete state.ratings[s.id];
+        else state.ratings[s.id] = { n: n, cat: s.cat };
+        lsSet('ps:rate', state.ratings);
+        render();
+        var el = document.getElementById('card-' + s.id.replace('/', '-'));
+        if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+      };
+    });
+    var pb = d.querySelector('#photoBtn');
+    if (pb) pb.onclick = function (e) { e.stopPropagation(); loadPhotos(s); };
+    var kb = d.querySelector('#keyBtn');
+    if (kb) kb.onclick = function (e) { e.stopPropagation(); $('flHelp').textContent = ''; openSettings(); };
     var sb = d.querySelector('#saveBtn');
     sb.onclick = function (e) {
       e.stopPropagation();
@@ -752,7 +985,7 @@ if (typeof document !== 'undefined') {
     var sortSel = $('sort');
     sortSel.onchange = function () {
       if (sortSel.value === 'popular' && !state.flickrKey) {
-        sortSel.value = 'near';
+        sortSel.value = state.sort;
         openSettings();
         $('flHelp').textContent = 'To sort by most photographed, add a free Flickr key first.';
         return;
@@ -787,10 +1020,16 @@ if (typeof document !== 'undefined') {
       state.flickrKey = $('flKey').value.trim();
       lsSet('ps:flkey', state.flickrKey);
       $('settingsModal').hidden = true;
-      if (!state.flickrKey) { state.sort = 'near'; $('sort').value = 'near'; }
-      else loadFlickr();
+      if (!state.flickrKey) {
+        if (state.sort === 'popular') { state.sort = 'best'; $('sort').value = 'best'; }
+      } else loadFlickr();
       render();
     };
+
+    /* When you come back to the app, refresh the times so "right now" is really right now. */
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && state.pos) { renderLightBar(); safeRender(); }
+    });
 
     setView('list');
     getLocation();

@@ -1,5 +1,5 @@
 // Keeps the app shell available when the connection is weak. Map data is never cached here.
-var SHELL = 'photo-spots-shell-v2';
+var SHELL = 'photo-spots-shell-v3';
 var FILES = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', function (e) {
